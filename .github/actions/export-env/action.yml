@@ -20,10 +20,16 @@ inputs:
     description: KEY=VALUE lines of secrets (the ENV_SECRETS workflow secret).
     default: ''
 
+outputs:
+  names:
+    description: Space-separated names of every variable this step exported.
+    value: ${{ steps.export.outputs.names }}
+
 runs:
   using: composite
   steps:
-    - shell: bash
+    - id: export
+      shell: bash
       env:
         EXPORT_ENV_LINES: ${{ inputs.env }}
         EXPORT_SECRET_NAMES: ${{ inputs.secret-names }}

@@ -7,6 +7,7 @@ import { appendFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 
 const out = process.env.GITHUB_ENV;
+const exported = [];
 const secrets = JSON.parse(process.env.EXPORT_SECRETS_JSON || '{}');
 
 function write(key, value) {
@@ -14,6 +15,7 @@ function write(key, value) {
 	// Heredoc form handles empty and multi-line values alike.
 	const eof = `EOF_${randomUUID()}`;
 	appendFileSync(out, `${key}<<${eof}\n${value}\n${eof}\n`);
+	exported.push(key);
 }
 
 // GitHub masks only the exact strings it knows are secrets. A value cut out of
@@ -69,3 +71,6 @@ for (const raw of (process.env.EXPORT_SECRET_LINES || '').split('\n')) {
 // Warn rather than fail: a suite may legitimately skip what a missing secret
 // would enable, and its own guards decide whether that is fatal.
 if (missing.length) console.log(`::warning::secrets not set in this repo: ${missing.join(', ')}`);
+// The names (never the values) go to the step output, so a later step can hand
+// exactly these variables to a container with `docker run -e KEY`.
+if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `names=${exported.join(' ')}\n`);

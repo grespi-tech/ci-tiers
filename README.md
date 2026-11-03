@@ -142,6 +142,11 @@ pattern is needed: pnpm comes from corepack, not `pnpm/action-setup`.
 - Job containers (Postgres, Playwright) run under dockerd, outside the
   runners' cgroup, so each one is capped with `--cpus`/`--memory` and
   `--cpu-shares 256` so production wins contention.
+- The E2E job is a host job that runs install, build and tests inside the
+  Playwright image with `docker run --network host`, rather than a
+  `container:` job: that is what lets it start the throwaway Postgres, mount
+  the box's pnpm store, and hand the container exactly the caller's variables
+  (by name) and nothing of the runner's own.
 - The repository's own lint (`self-check.yml`) is the one thing on a
   GitHub-hosted runner: this repository is public and the box's runner groups
   refuse public repositories.

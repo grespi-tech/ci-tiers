@@ -38,7 +38,7 @@ on:
         type: string
         default: ''
       e2e-build:
-        description: Commands run inside the Playwright container before the tests.
+        description: Commands run inside the Playwright container before the tests (build, migrate). PG* and `env` are set.
         type: string
         default: pnpm build
       e2e-shards:
@@ -55,7 +55,7 @@ on:
         type: string
         default: 3g
       e2e-container-options:
-        description: Extra docker options for the Playwright container (e.g. a -v mount for a shared pnpm store).
+        description: Extra `docker run` options for the Playwright container. The pnpm store is already mounted.
         type: string
         default: ''
       image:
@@ -407,12 +407,13 @@ jobs:
       - name: E2E setup
         run: ${{ inputs.e2e-setup }}
 
-  # Tier 3: Playwright inside Microsoft's image (browsers and their system
-  # packages included). --user 1001 is the runner user's uid on the box, so the
-  # bind-mounted workspace stays writable; Firefox refuses to run as root.
-  # --cpus/--memory: job containers run under dockerd, outside the runners'
-  # cgroup, so the cap has to be set here. --cpu-shares 256 gives the host's
-  # other services priority. --ipc=host is Playwright's recommendation.
+  # Tier 3: Playwright. A host job (so it can start the throwaway Postgres and
+  # mount the box's pnpm store) that runs install, build and the tests inside
+  # Microsoft's Playwright image, which ships the browsers and their system
+  # packages. --network host so 127.0.0.1:$PGPORT means the same inside; the
+  # runner's uid so the bind-mounted workspace stays writable (Firefox refuses
+  # to run as root); --cpus/--memory because job containers run under dockerd,
+  # outside the runners' cgroup; --cpu-shares 256 so production wins contention.
   e2e:
     name: e2e (${{ matrix.shard }}/${{ strategy.job-total }})
     needs: [plan, test, e2e-setup]
@@ -425,37 +426,78 @@ jobs:
     permissions:
       contents: read
       packages: read
-    container:
-      image: ${{ inputs.e2e-image }}
-      options: >-
-        --user 1001 --cpus ${{ inputs.e2e-container-cpus }} --memory ${{ inputs.e2e-container-memory }}
-        --cpu-shares 256 --ipc=host --init ${{ inputs.e2e-container-options }}
     strategy:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(inputs.e2e-shards) }}
     steps:
       - uses: actions/checkout@v4
+      # Node and pnpm on the host only to find the pnpm store; nothing is installed here.
       - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
         with:
           node-version: ${{ inputs.node-version }}
           pnpm-version: ${{ inputs.pnpm-version }}
-          npm-scope: ${{ inputs.npm-scope }}
-          npm-registry: ${{ inputs.npm-registry }}
-          npm-token: ${{ secrets.NPM_TOKEN || github.token }}
-      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
+          install: 'false'
+      - if: inputs.postgres != ''
+        uses: grespi-tech/ci-tiers/.github/actions/postgres@v1.0.0
+        with:
+          image: ${{ inputs.postgres }}
+          databases: ${{ inputs.postgres-databases }}
+      - id: env
+        uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
         with:
           env: ${{ inputs.env }}
           secret-names: ${{ inputs.secret-names }}
           secrets-json: ${{ toJSON(secrets) }}
           secret-lines: ${{ secrets.ENV_SECRETS }}
-      - name: Build
-        run: ${{ inputs.e2e-build }}
-      - name: Test
+      - name: Install, build and test in the Playwright image
         env:
-          SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+          IMAGE: ${{ inputs.e2e-image }}
+          CPUS: ${{ inputs.e2e-container-cpus }}
+          MEMORY: ${{ inputs.e2e-container-memory }}
+          OPTIONS: ${{ inputs.e2e-container-options }}
+          EXPORTED: ${{ steps.env.outputs.names }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN || github.token }}
+          NPM_SCOPE: ${{ inputs.npm-scope }}
+          NPM_REGISTRY: ${{ inputs.npm-registry }}
+          PNPM_VERSION: ${{ inputs.pnpm-version }}
+          BUILD: ${{ inputs.e2e-build }}
           TEST: ${{ inputs.e2e }}
-        run: $TEST --shard="$SHARD"
+          SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+        run: |
+          set -euo pipefail
+          store="$(pnpm store path)"
+          mkdir -p "$store"
+          # Only the caller's variables cross into the container, by name (-e KEY
+          # copies the value from this job's env), never the runner's own.
+          args=(-e CI=true -e HOME=/tmp/home -e NODE_AUTH_TOKEN -e NPM_SCOPE -e NPM_REGISTRY
+                -e PNPM_VERSION -e BUILD -e TEST -e SHARD -e npm_config_store_dir=/pnpm-store)
+          for k in $EXPORTED PGHOST PGPORT PGUSER PGPASSWORD; do
+            [ -n "${!k:-}" ] && args+=(-e "$k")
+          done
+          # shellcheck disable=SC2086
+          docker run --rm --network host --init --ipc=host \
+            --user "$(id -u):$(id -g)" --cpus "$CPUS" --memory "$MEMORY" --cpu-shares 256 \
+            -v "$GITHUB_WORKSPACE:/work" -w /work -v "$store:/pnpm-store" \
+            "${args[@]}" $OPTIONS "$IMAGE" bash -euo pipefail -c '
+              mkdir -p "$HOME"
+              if [ -n "$NPM_SCOPE" ]; then
+                host="${NPM_REGISTRY#https://}"; host="${host#http://}"
+                printf "%s:registry=%s\n//%s/:_authToken=\${NODE_AUTH_TOKEN}\n" "$NPM_SCOPE" "$NPM_REGISTRY" "${host%/}" > "$HOME/.npmrc"
+                export NPM_CONFIG_USERCONFIG="$HOME/.npmrc"
+              fi
+              if [ -n "$PNPM_VERSION" ]; then
+                npm_config_prefix="$HOME/npm-global" npm install -g "pnpm@${PNPM_VERSION}" >/dev/null
+                export PATH="$HOME/npm-global/bin:$PATH"
+              else
+                export COREPACK_ENABLE_DOWNLOAD_PROMPT=0 COREPACK_HOME="$HOME/corepack"
+                corepack enable --install-directory "$HOME/bin"; export PATH="$HOME/bin:$PATH"
+              fi
+              pnpm --version
+              pnpm install --frozen-lockfile
+              printf "%s\n" "$BUILD" | bash -euo pipefail
+              $TEST --shard="$SHARD"
+            '
       # Artifact storage is billed apart from minutes; a storage problem must
       # not turn a green run red.
       - name: Upload report
@@ -466,6 +508,9 @@ jobs:
           name: playwright-report-${{ matrix.shard }}
           path: ${{ inputs.e2e-report-path }}
           retention-days: 14
+      - name: Stop Postgres
+        if: always() && inputs.postgres != ''
+        run: docker rm -f "$PGCONTAINER" >/dev/null 2>&1 || true
 
   # Tier 3: the production image. Built with the npm token as a BuildKit
   # secret, checked to be in no layer, smoke-tested, then saved as an artifact
