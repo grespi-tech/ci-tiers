@@ -4,6 +4,9 @@
 #
 #   sudo ./install-fast-runner.sh <scope-url> <name> [runner-version]
 #
+#   runner-version defaults to the latest actions/runner release. The tarball's
+#   sha256 is taken from that release's notes and verified.
+#
 #   scope-url   https://github.com/<org>            (organisation runner)
 #               https://github.com/<owner>/<repo>  (repository runner)
 #   name        udb-ci-fast-paqett, udb-ci-fast-grespi, udb-ci-fast-sparsh ...
@@ -19,7 +22,7 @@ set -euo pipefail
 
 scope="${1:?scope url}"
 name="${2:?runner name}"
-version="${3:-2.330.0}"
+version="${3:-$(curl -sSf https://api.github.com/repos/actions/runner/releases/latest | grep -oE '"tag_name": *"v[0-9.]+"' | grep -oE '[0-9.]+')}"
 : "${GH_RUNNER_TOKEN:?set GH_RUNNER_TOKEN to a registration token}"
 user="${RUNNER_USER:-runner}"
 base="${RUNNER_BASE:-/opt/actions-runners}"
@@ -33,39 +36,43 @@ fi
 install -d -o "$user" -g "$user" "$dir"
 if [ ! -x "$dir/run.sh" ]; then
   tarball="actions-runner-linux-x64-${version}.tar.gz"
-  curl -sSfL -o "/tmp/$tarball" "https://github.com/actions/runner/releases/download/v${version}/${tarball}"
-  # Checksum from the release page; refuse to install without it.
-  curl -sSfL "https://github.com/actions/runner/releases/download/v${version}/${tarball}.sha256" 2>/dev/null \
-    | sed "s#  .*#  /tmp/$tarball#" | sha256sum -c - || {
-      echo "no checksum published for v${version}; verify /tmp/$tarball by hand and re-run with it unpacked in $dir" >&2
-      exit 1
-    }
-  tar -xzf "/tmp/$tarball" -C "$dir"
+  tmp="$(mktemp -d)"
+  curl -sSfL -o "$tmp/$tarball" "https://github.com/actions/runner/releases/download/v${version}/${tarball}"
+  # actions/runner publishes the sha256 in the release notes, not as an asset.
+  sha="${RUNNER_SHA256:-$(curl -sSf "https://api.github.com/repos/actions/runner/releases/tags/v${version}" \
+    | grep -oE "[0-9a-f]{64} +${tarball//./\\.}" | grep -oE '^[0-9a-f]{64}' | head -n1)}"
+  [ -n "$sha" ] || { echo "no sha256 for $tarball in the release notes; set RUNNER_SHA256" >&2; exit 1; }
+  echo "$sha  $tmp/$tarball" | sha256sum -c -
+  tar -xzf "$tmp/$tarball" -C "$dir"
   chown -R "$user:$user" "$dir"
-  rm -f "/tmp/$tarball"
+  rm -rf "$tmp"
 fi
 
 # Slice first, so the service drop-in below can reference it.
 install -m 0644 "$(dirname "$0")/ci-fast.slice" /etc/systemd/system/ci-fast.slice
 systemctl daemon-reload
 
-sudo -u "$user" env GH_RUNNER_TOKEN="$GH_RUNNER_TOKEN" bash -c "
+# --preserve-env keeps the token out of the process list; config.sh itself
+# needs it on its command line, briefly (the token lives one hour).
+sudo -u "$user" --preserve-env=GH_RUNNER_TOKEN bash -c "
   cd '$dir' &&
   ./config.sh --unattended --replace \
     --url '$scope' --token \"\$GH_RUNNER_TOKEN\" \
-    --name '$name' --labels ci-fast --work _work \
-    --disableupdate
+    --name '$name' --labels ci-fast --work _work
 "
 
 (cd "$dir" && ./svc.sh install "$user" >/dev/null)
-svc="$(find /etc/systemd/system -maxdepth 1 -name "actions.runner.*${name}*.service" -printf '%f\n' | head -n1)"
+svc="$(find /etc/systemd/system -maxdepth 1 -name "actions.runner.*.${name}.service" -printf '%f\n' | head -n1)"
 [ -n "$svc" ] || { echo "svc.sh did not create a unit for $name" >&2; exit 1; }
 install -d "/etc/systemd/system/${svc}.d"
 cat > "/etc/systemd/system/${svc}.d/slice.conf" <<CONF
 [Service]
 Slice=ci-fast.slice
 Nice=10
-IOSchedulingClass=idle
+# best-effort, not idle: idle would starve checkout and install whenever
+# production is busy on disk.
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 # The fast tier runs no containers; keep docker.sock out of reach of its jobs.
 Environment=DOCKER_HOST=unix:///nonexistent
 CONF

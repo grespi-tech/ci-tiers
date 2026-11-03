@@ -34,6 +34,20 @@ also points `DOCKER_HOST` at nothing.
 
 Then switch the callers: `runs-on-fast: '["self-hosted", "ci-fast"]'`.
 
+## Capped image builds and registry pulls
+
+Tier 3's `docker build` is the one step that would otherwise run uncapped.
+Create a builder once and the workflow uses it automatically:
+
+```sh
+docker buildx create --name ci --driver docker-container \
+  --driver-opt cpu-quota=200000,memory=3g,cpu-shares=256 --bootstrap
+```
+
+Docker Hub allows a few anonymous pulls an hour per IP; pre-pull or log in
+once as the runner user so `postgres:17` and the Playwright image never fail
+a run (`docker login` with a read-only token, or `docker pull` them now).
+
 ## Disk
 
 Tier 3 removes its image and smoke containers at the end of every run, but

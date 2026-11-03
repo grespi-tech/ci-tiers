@@ -23,7 +23,13 @@ function write(key, value) {
 // clear in every later step's env listing. Register each one before export.
 // (v1.1.0-v1.2.0 lacked this and leaked ENV_SECRETS values into job logs.)
 function writeSecret(key, value) {
-	for (const line of value.split('\n')) if (line.trim()) console.log(`::add-mask::${line}`);
+	// Masking a 1-3 character value would redact every occurrence of those
+	// characters in the log; such a value is not a secret worth the damage.
+	for (const line of value.split('\n')) {
+		if (!line.trim()) continue;
+		if (line.trim().length < 4) console.log(`::warning::${key} is shorter than 4 characters and is not masked`);
+		else console.log(`::add-mask::${line}`);
+	}
 	write(key, value);
 }
 

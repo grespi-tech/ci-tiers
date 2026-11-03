@@ -1,15 +1,25 @@
 name: postgres
 description: >
-  Start a throwaway Postgres container on a free 127.0.0.1 port and export
-  PGHOST/PGPORT/PGUSER/PGPASSWORD/PGCONTAINER. Data lives in tmpfs. Capped and
-  at low CPU priority because job containers run outside the runners' cgroup.
-  Composite actions have no post step: the job removes $PGCONTAINER itself.
+  Start a throwaway Postgres container and export PGHOST/PGPORT/PGUSER/
+  PGPASSWORD/PGCONTAINER. Without `network`, it listens on a free 127.0.0.1
+  port (host jobs). With `network`, it joins that bridge network with no host
+  port and PGHOST is the container name (for a job that runs its tests in
+  another container on the same network). Data lives in tmpfs. Capped and at
+  low CPU priority because job containers run outside the runners' cgroup.
+  Labelled ci-tiers.run=<run id> and ci-tiers.job=<instance>; the job's clean-up
+  removes everything with those labels, so nothing is orphaned if a step fails.
 
 inputs:
   image:
     default: postgres:17
   databases:
     description: Space-separated databases to create besides the default `postgres`.
+    default: ''
+  instance:
+    description: Distinguishes several servers in one run (job name, shard). Part of the container name and label.
+    default: default
+  network:
+    description: Docker network to join instead of publishing a host port.
     default: ''
   cpus:
     default: '1'
@@ -23,18 +33,26 @@ runs:
       env:
         IMAGE: ${{ inputs.image }}
         DATABASES: ${{ inputs.databases }}
+        INSTANCE: ${{ inputs.instance }}
+        NETWORK: ${{ inputs.network }}
         CPUS: ${{ inputs.cpus }}
         MEMORY: ${{ inputs.memory }}
       run: |
         set -euo pipefail
-        name="ci-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
-        docker rm -f "$name" >/dev/null 2>&1 || true
-        # Port 0: Docker picks a free port, so concurrent jobs on one box never collide.
-        docker run -d --rm --name "$name" --cpus "$CPUS" --memory "$MEMORY" --cpu-shares 256 \
-          -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
-          --tmpfs /var/lib/postgresql/data \
-          -p 127.0.0.1:0:5432 "$IMAGE" >/dev/null
-        port=$(docker port "$name" 5432/tcp | head -n1 | cut -d: -f2)
+        name="ci-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${INSTANCE}-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        label="ci-tiers.run=${GITHUB_RUN_ID}"
+        args=(-d --rm --name "$name" --label "$label" --label "ci-tiers.job=${INSTANCE}"
+              --cpus "$CPUS" --memory "$MEMORY" --cpu-shares 256
+              -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres
+              # Postgres 18 moved the data directory; pin it so the tmpfs applies.
+              -e PGDATA=/var/lib/postgresql/data --tmpfs /var/lib/postgresql/data)
+        if [ -n "$NETWORK" ]; then
+          args+=(--network "$NETWORK")
+        else
+          # Port 0: Docker picks a free port, so concurrent jobs on one box never collide.
+          args+=(-p 127.0.0.1:0:5432)
+        fi
+        docker run "${args[@]}" "$IMAGE" >/dev/null
         for _ in $(seq 1 60); do
           docker exec "$name" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && break
           sleep 1
@@ -43,11 +61,16 @@ runs:
         for db in $DATABASES; do
           docker exec "$name" psql -U postgres -v ON_ERROR_STOP=1 -qc "CREATE DATABASE \"$db\""
         done
+        if [ -n "$NETWORK" ]; then
+          host="$name"; port=5432
+        else
+          host=127.0.0.1; port=$(docker port "$name" 5432/tcp | head -n1 | cut -d: -f2)
+        fi
         {
           echo "PGCONTAINER=$name"
-          echo "PGHOST=127.0.0.1"
+          echo "PGHOST=$host"
           echo "PGPORT=$port"
           echo "PGUSER=postgres"
           echo "PGPASSWORD=postgres"
         } >> "$GITHUB_ENV"
-        echo "Postgres $IMAGE on 127.0.0.1:$port"
+        echo "Postgres $IMAGE at $host:$port"

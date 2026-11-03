@@ -34,3 +34,14 @@ jobs:
           echo "$dir" >> "$GITHUB_PATH"
       - run: actionlint -color
       - run: shellcheck -x runners/*.sh
+      # The workflow pins its own composite actions at a tag. A tagged commit
+      # whose references name another tag would run stale actions silently.
+      - name: Self-references match the tag
+        run: |
+          set -euo pipefail
+          git fetch --tags --quiet origin
+          tag="$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+          refs="$(grep -oE 'grespi-tech/ci-tiers/\.github/actions/[a-z-]+@v[0-9.]+' .github/workflows/tiered.yml | sed 's/.*@//' | sort -u)"
+          echo "tag: ${tag:-none}; references: $refs"
+          [ "$(printf '%s\n' "$refs" | wc -l)" -eq 1 ] || { echo "::error::mixed action references"; exit 1; }
+          [ -z "$tag" ] || [ "$refs" = "$tag" ] || { echo "::error::tagged $tag but actions reference $refs"; exit 1; }

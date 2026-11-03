@@ -5,13 +5,17 @@ name: tiered
 # gated on that number, so a stacked PR costs a typecheck and a push to main
 # costs the full image build. See README.md for the table.
 #
-#   tier 0  nothing      drafts, docs-only changes, label ci:skip
+#   tier 0  nothing      drafts, fork PRs, docs-only changes, label ci:skip
 #   tier 1  fast         typecheck + lint (+ gitleaks): any other PR or branch push
 #   tier 2  test         + unit/integration tests with Postgres: pushes to integration/*
 #   tier 3  full         + E2E + image build and smoke: PRs into main, pushes to main
 #
 # Labels ci:skip / ci:fast / ci:test / ci:full on a PR override the default.
 # The `tier` input overrides everything (for workflow_dispatch).
+#
+# Containers started here carry the label ci-tiers.run=<run id>; the clean-up
+# steps remove everything with that label, so a failed step cannot leave a
+# container behind on the box. Callers' own containers should carry it too.
 
 on:
   workflow_call:
@@ -63,7 +67,7 @@ on:
         type: boolean
         default: false
       image-name:
-        description: Image name used for the local tag and the artifact. Default = repository name.
+        description: Image name used for the local tag and the artifact (lower-cased). Default = repository name.
         type: string
         default: ''
       image-context:
@@ -78,7 +82,7 @@ on:
         type: string
         default: npm_token
       image-smoke:
-        description: Commands run after the build; $IMAGE_TAG names the image, PG* point at the smoke database when `postgres` is set.
+        description: Commands run after the build; $IMAGE_TAG names the image, $CI_LABEL is the docker label to put on containers, PG* point at the smoke database when `postgres` is set.
         type: string
         default: ''
       image-retention-days:
@@ -90,7 +94,7 @@ on:
         default: false
       # ---- environment -----------------------------------------------------
       postgres:
-        description: Postgres image for the test and image-smoke jobs, e.g. postgres:17. Empty = none.
+        description: Postgres image for the test, e2e and image-smoke jobs, e.g. postgres:17. Empty = none.
         type: string
         default: ''
       postgres-databases:
@@ -98,7 +102,7 @@ on:
         type: string
         default: ''
       env:
-        description: KEY=VALUE lines exported in every job; ${VAR} expands at runtime (${PGPORT} etc.).
+        description: KEY=VALUE lines exported in every job; ${VAR} expands at runtime. Write database URLs as ${PGHOST}:${PGPORT}, never 127.0.0.1, so they also hold inside the E2E container.
         type: string
         default: ''
       secret-names:
@@ -169,8 +173,12 @@ on:
         description: Token for the npm-scope registry when the caller's GITHUB_TOKEN cannot read it (another owner's packages).
         required: false
 
+env:
+  CI_LABEL: ci-tiers.run=${{ github.run_id }}
+
 jobs:
-  # Decides the tier. No checkout: changed files come from the compare API.
+  # Decides the tier. No checkout and no node: changed files come from the
+  # compare API and are parsed with grep.
   plan:
     name: plan
     runs-on: ${{ fromJSON(inputs.runs-on-fast) }}
@@ -206,14 +214,16 @@ jobs:
 
           # Are all changed files docs? Uses the compare API, so no checkout is
           # needed. 300+ files, an unknown range or an API error = not docs-only.
+          # Renames count both names.
           docs_only() {
-            local base="$1" head="$2" files n f p matched
+            local base="$1" head="$2" json files n f p matched
             [ -n "$base" ] && [ -n "$head" ] || return 1
             case "$base" in 0000000000000000000000000000000000000000) return 1;; esac
-            files=$(curl -sSf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "$API/repos/$REPO/compare/$base...$head?per_page=1" \
-              | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);const f=j.files||[];if(f.length>=300){process.exit(2)}console.log(f.map(x=>x.filename).join("\n"))})' 2>/dev/null) || return 1
+            json=$(curl -sSf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$API/repos/$REPO/compare/$base...$head?per_page=1") || return 1
+            files=$(printf '%s' "$json" | grep -oE '"(filename|previous_filename)": *"[^"]*"' | sed -E 's/^[^:]*: *"//; s/"$//') || return 1
             [ -n "$files" ] || return 1
+            [ "$(printf '%s\n' "$files" | grep -c .)" -lt 300 ] || return 1
             n=0
             while IFS= read -r f; do
               [ -n "$f" ] || continue
@@ -221,15 +231,29 @@ jobs:
               while IFS= read -r p; do
                 p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
                 [ -n "$p" ] || continue
-                case "$p" in '**/'*) p="*${p#\*\*}";; esac      # **/x.md -> *x.md (matches any depth)
-                case "$p" in *'/**') p="${p%/\*\*}/*";; esac    # docs/** -> docs/*
-                # shellcheck disable=SC2254
-                case "$f" in $p) matched=1; break;; esac
+                if glob_match "$f" "$p"; then matched=1; break; fi
               done <<< "$DOCS_PATHS"
               [ "$matched" = 1 ] || return 1
               n=$((n+1))
             done <<< "$files"
             [ "$n" -gt 0 ]
+          }
+
+          # glob_match <file> <pattern>: `*` matches across slashes (as in
+          # [[ ]]/case), `docs/**` means docs/*, `**/x.md` means x.md at any
+          # depth including the root.
+          glob_match() {
+            local f="$1" p="$2" pat
+            case "$p" in *'/**') p="${p%/\*\*}/*";; esac
+            case "$p" in
+              '**/'*) set -- "${p#\*\*/}" "*/${p#\*\*/}";;
+              *) set -- "$p";;
+            esac
+            for pat in "$@"; do
+              # shellcheck disable=SC2254
+              case "$f" in $pat) return 0;; esac
+            done
+            return 1
           }
 
           if [ "$FORCED" != "auto" ] && [ -n "$FORCED" ]; then
@@ -278,7 +302,7 @@ jobs:
   gitleaks:
     name: secret scan
     needs: plan
-    if: inputs.gitleaks && fromJSON(needs.plan.outputs.tier) >= 1
+    if: inputs.gitleaks && fromJSON(needs.plan.outputs.tier || '0') >= 1
     runs-on: ${{ fromJSON(inputs.runs-on-fast) }}
     timeout-minutes: 10
     permissions:
@@ -291,6 +315,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install gitleaks
         run: |
           set -euo pipefail
@@ -307,6 +332,7 @@ jobs:
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
+          # workflow_dispatch and schedule have no range: the head commit alone, then the tree.
           if [ -n "$BASE_SHA" ] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
             range="${BASE_SHA}..${HEAD_SHA}"
           else
@@ -322,7 +348,7 @@ jobs:
   fast:
     name: fast
     needs: plan
-    if: fromJSON(needs.plan.outputs.tier) >= 1
+    if: fromJSON(needs.plan.outputs.tier || '0') >= 1
     runs-on: ${{ fromJSON(inputs.runs-on-fast) }}
     timeout-minutes: ${{ inputs.timeout-fast }}
     permissions:
@@ -330,6 +356,8 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
         with:
           node-version: ${{ inputs.node-version }}
@@ -341,7 +369,7 @@ jobs:
         with:
           env: ${{ inputs.env }}
           secret-names: ${{ inputs.secret-names }}
-          secrets-json: ${{ toJSON(secrets) }}
+          secrets-json: ${{ inputs.secret-names != '' && toJSON(secrets) || '{}' }}
           secret-lines: ${{ secrets.ENV_SECRETS }}
       - name: Fast checks
         run: ${{ inputs.fast }}
@@ -351,7 +379,7 @@ jobs:
   test:
     name: test
     needs: [plan, fast]
-    if: inputs.test != '' && fromJSON(needs.plan.outputs.tier) >= 2
+    if: inputs.test != '' && fromJSON(needs.plan.outputs.tier || '0') >= 2
     runs-on: ${{ fromJSON(inputs.runs-on-heavy) }}
     timeout-minutes: ${{ inputs.timeout-test }}
     permissions:
@@ -359,6 +387,8 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
         with:
           node-version: ${{ inputs.node-version }}
@@ -371,17 +401,18 @@ jobs:
         with:
           image: ${{ inputs.postgres }}
           databases: ${{ inputs.postgres-databases }}
+          instance: test
       - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
         with:
           env: ${{ inputs.env }}
           secret-names: ${{ inputs.secret-names }}
-          secrets-json: ${{ toJSON(secrets) }}
+          secrets-json: ${{ inputs.secret-names != '' && toJSON(secrets) || '{}' }}
           secret-lines: ${{ secrets.ENV_SECRETS }}
       - name: Tests
         run: ${{ inputs.test }}
-      - name: Stop Postgres
-        if: always() && inputs.postgres != ''
-        run: docker rm -f "$PGCONTAINER" >/dev/null 2>&1 || true
+      - name: Clean up
+        if: always()
+        run: docker ps -aq --filter "label=$CI_LABEL" --filter "label=ci-tiers.job=test" | xargs -r docker rm -f >/dev/null 2>&1 || true
 
   # Tier 3, before E2E: a plain Node job for seeding or provisioning.
   e2e-setup:
@@ -390,7 +421,8 @@ jobs:
     # !cancelled() + explicit results: a skipped `test` (repo without a test
     # input) must not skip the rest of tier 3, a failed one must.
     if: >-
-      !cancelled() && inputs.e2e-image != '' && inputs.e2e-setup != '' && fromJSON(needs.plan.outputs.tier) >= 3
+      !cancelled() && needs.plan.result == 'success'
+      && inputs.e2e-image != '' && inputs.e2e-setup != '' && fromJSON(needs.plan.outputs.tier || '0') >= 3
       && needs.fast.result == 'success'
       && (needs.test.result == 'success' || (needs.test.result == 'skipped' && inputs.test == ''))
     runs-on: ${{ fromJSON(inputs.runs-on-heavy) }}
@@ -400,6 +432,8 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
         with:
           node-version: ${{ inputs.node-version }}
@@ -411,23 +445,25 @@ jobs:
         with:
           env: ${{ inputs.env }}
           secret-names: ${{ inputs.secret-names }}
-          secrets-json: ${{ toJSON(secrets) }}
+          secrets-json: ${{ inputs.secret-names != '' && toJSON(secrets) || '{}' }}
           secret-lines: ${{ secrets.ENV_SECRETS }}
       - name: E2E setup
         run: ${{ inputs.e2e-setup }}
 
-  # Tier 3: Playwright. A host job (so it can start the throwaway Postgres and
-  # mount the box's pnpm store) that runs install, build and the tests inside
-  # Microsoft's Playwright image, which ships the browsers and their system
-  # packages. --network host so 127.0.0.1:$PGPORT means the same inside; the
-  # runner's uid so the bind-mounted workspace stays writable (Firefox refuses
-  # to run as root); --cpus/--memory because job containers run under dockerd,
-  # outside the runners' cgroup; --cpu-shares 256 so production wins contention.
+  # Tier 3: Playwright. A host job that runs install, build and the tests
+  # inside Microsoft's Playwright image (browsers and their system packages
+  # included), on a bridge network of its own shared only with its Postgres:
+  # nothing it listens on reaches the box's host network, so two shards or a
+  # production port can never collide. The runner's uid keeps the bind-mounted
+  # workspace writable (Firefox refuses to run as root); --cpus/--memory because
+  # job containers run under dockerd, outside the runners' cgroup; --cpu-shares
+  # 256 so production wins contention.
   e2e:
     name: e2e (${{ matrix.shard }}/${{ strategy.job-total }})
     needs: [plan, fast, test, e2e-setup]
     if: >-
-      !cancelled() && inputs.e2e-image != '' && fromJSON(needs.plan.outputs.tier) >= 3
+      !cancelled() && needs.plan.result == 'success'
+      && inputs.e2e-image != '' && fromJSON(needs.plan.outputs.tier || '0') >= 3
       && needs.fast.result == 'success'
       && (needs.test.result == 'success' || (needs.test.result == 'skipped' && inputs.test == ''))
       && (needs.e2e-setup.result == 'success' || (needs.e2e-setup.result == 'skipped' && inputs.e2e-setup == ''))
@@ -440,25 +476,33 @@ jobs:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(inputs.e2e-shards) }}
+    env:
+      NET: ci-${{ github.run_id }}-${{ github.run_attempt }}-e2e-${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # Node and pnpm on the host only to find the pnpm store; nothing is installed here.
       - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
         with:
           node-version: ${{ inputs.node-version }}
           pnpm-version: ${{ inputs.pnpm-version }}
           install: 'false'
+      - name: Network
+        run: docker network create --label "$CI_LABEL" "$NET" >/dev/null
       - if: inputs.postgres != ''
         uses: grespi-tech/ci-tiers/.github/actions/postgres@v1.0.0
         with:
           image: ${{ inputs.postgres }}
           databases: ${{ inputs.postgres-databases }}
+          instance: e2e-${{ matrix.shard }}
+          network: ${{ env.NET }}
       - id: env
         uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
         with:
           env: ${{ inputs.env }}
           secret-names: ${{ inputs.secret-names }}
-          secrets-json: ${{ toJSON(secrets) }}
+          secrets-json: ${{ inputs.secret-names != '' && toJSON(secrets) || '{}' }}
           secret-lines: ${{ secrets.ENV_SECRETS }}
       - name: Install, build and test in the Playwright image
         env:
@@ -467,7 +511,7 @@ jobs:
           MEMORY: ${{ inputs.e2e-container-memory }}
           OPTIONS: ${{ inputs.e2e-container-options }}
           EXPORTED: ${{ steps.env.outputs.names }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN || github.token }}
+          NODE_AUTH_TOKEN: ${{ inputs.npm-scope != '' && (secrets.NPM_TOKEN || github.token) || '' }}
           NPM_SCOPE: ${{ inputs.npm-scope }}
           NPM_REGISTRY: ${{ inputs.npm-registry }}
           PNPM_VERSION: ${{ inputs.pnpm-version }}
@@ -476,32 +520,37 @@ jobs:
           SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
         run: |
           set -euo pipefail
-          store="$(pnpm store path)"
+          # pnpm store path ends in /vN; mount its parent so the container's
+          # pnpm (which appends /vN itself) shares the box's store.
+          store="$(dirname "$(pnpm store path)")"
           mkdir -p "$store"
           # Only the caller's variables cross into the container, by name (-e KEY
           # copies the value from this job's env), never the runner's own.
-          args=(-e CI=true -e HOME=/tmp/home -e NODE_AUTH_TOKEN -e NPM_SCOPE -e NPM_REGISTRY
-                -e PNPM_VERSION -e BUILD -e TEST -e SHARD -e npm_config_store_dir=/pnpm-store)
+          args=(-e CI=true -e HOME=/tmp/home -e NPM_SCOPE -e NPM_REGISTRY -e PNPM_VERSION
+                -e BUILD -e TEST -e SHARD -e npm_config_store_dir=/pnpm-store)
+          [ -n "$NODE_AUTH_TOKEN" ] && args+=(-e NODE_AUTH_TOKEN)
           for k in $EXPORTED PGHOST PGPORT PGUSER PGPASSWORD; do
             [ -n "${!k:-}" ] && args+=(-e "$k")
           done
           # shellcheck disable=SC2086
-          docker run --rm --network host --init --ipc=host \
+          docker run --rm --network "$NET" --label "$CI_LABEL" --init --ipc=host \
             --user "$(id -u):$(id -g)" --cpus "$CPUS" --memory "$MEMORY" --cpu-shares 256 \
             -v "$GITHUB_WORKSPACE:/work" -w /work -v "$store:/pnpm-store" \
             "${args[@]}" $OPTIONS "$IMAGE" bash -euo pipefail -c '
-              mkdir -p "$HOME"
-              if [ -n "$NPM_SCOPE" ]; then
+              mkdir -p "$HOME/bin" "$HOME/npm-global"
+              export PATH="$HOME/bin:$HOME/npm-global/bin:$PATH"
+              if [ -n "${NPM_SCOPE:-}" ]; then
                 host="${NPM_REGISTRY#https://}"; host="${host#http://}"
                 printf "%s:registry=%s\n//%s/:_authToken=\${NODE_AUTH_TOKEN}\n" "$NPM_SCOPE" "$NPM_REGISTRY" "${host%/}" > "$HOME/.npmrc"
                 export NPM_CONFIG_USERCONFIG="$HOME/.npmrc"
               fi
-              if [ -n "$PNPM_VERSION" ]; then
+              if [ -n "${PNPM_VERSION:-}" ]; then
                 npm_config_prefix="$HOME/npm-global" npm install -g "pnpm@${PNPM_VERSION}" >/dev/null
-                export PATH="$HOME/npm-global/bin:$PATH"
               else
+                # Newer Node images ship without corepack.
+                command -v corepack >/dev/null || npm_config_prefix="$HOME/npm-global" npm install -g corepack >/dev/null
                 export COREPACK_ENABLE_DOWNLOAD_PROMPT=0 COREPACK_HOME="$HOME/corepack"
-                corepack enable --install-directory "$HOME/bin"; export PATH="$HOME/bin:$PATH"
+                corepack enable --install-directory "$HOME/bin"
               fi
               pnpm --version
               pnpm install --frozen-lockfile
@@ -518,19 +567,24 @@ jobs:
           name: playwright-report-${{ matrix.shard }}
           path: ${{ inputs.e2e-report-path }}
           retention-days: 14
-      - name: Stop Postgres
-        if: always() && inputs.postgres != ''
-        run: docker rm -f "$PGCONTAINER" >/dev/null 2>&1 || true
+      - name: Clean up
+        if: always()
+        run: |
+          docker ps -aq --filter "label=$CI_LABEL" --filter "label=ci-tiers.job=e2e-${{ matrix.shard }}" | xargs -r docker rm -f >/dev/null 2>&1 || true
+          docker network rm "$NET" >/dev/null 2>&1 || true
 
   # Tier 3: the production image. Built with the npm token as a BuildKit
   # secret, checked to be in no layer, smoke-tested, then saved as an artifact
-  # the box can `docker load` without registry credentials. The image and the
-  # smoke containers are removed at the end so the box's disk does not grow.
+  # the box can `docker load` without registry credentials. The image and
+  # every labelled container are removed at the end so the box's disk does
+  # not grow. If a buildx builder named `ci` exists on the box (runners/README)
+  # the build runs inside it, capped; otherwise plain `docker build`.
   image:
     name: image
     needs: [plan, fast, test]
     if: >-
-      !cancelled() && inputs.image && fromJSON(needs.plan.outputs.tier) >= 3
+      !cancelled() && needs.plan.result == 'success'
+      && inputs.image && fromJSON(needs.plan.outputs.tier || '0') >= 3
       && needs.fast.result == 'success'
       && (needs.test.result == 'success' || (needs.test.result == 'skipped' && inputs.test == ''))
     runs-on: ${{ fromJSON(inputs.runs-on-heavy) }}
@@ -539,16 +593,27 @@ jobs:
       contents: read
       packages: read
     env:
-      IMAGE_NAME: ${{ inputs.image-name || github.event.repository.name }}
-      IMAGE_TAG: ${{ inputs.image-name || github.event.repository.name }}:${{ github.sha }}
       DOCKER_BUILDKIT: '1'
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Image name
+        env:
+          INPUT_NAME: ${{ inputs.image-name }}
+        run: |
+          set -euo pipefail
+          name="$(printf '%s' "${INPUT_NAME:-${GITHUB_REPOSITORY#*/}}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g')"
+          {
+            echo "IMAGE_NAME=$name"
+            echo "IMAGE_TAG=${name}:${GITHUB_SHA}"
+          } >> "$GITHUB_ENV"
       - if: inputs.postgres != '' && inputs.image-smoke != ''
         uses: grespi-tech/ci-tiers/.github/actions/postgres@v1.0.0
         with:
           image: ${{ inputs.postgres }}
           databases: ${{ inputs.postgres-databases }}
+          instance: image
       # setup-node only so export-env has node; nothing is installed.
       - uses: actions/setup-node@v4
         with:
@@ -557,7 +622,7 @@ jobs:
         with:
           env: ${{ inputs.env }}
           secret-names: ${{ inputs.secret-names }}
-          secrets-json: ${{ toJSON(secrets) }}
+          secrets-json: ${{ inputs.secret-names != '' && toJSON(secrets) || '{}' }}
           secret-lines: ${{ secrets.ENV_SECRETS }}
       - name: Build
         env:
@@ -567,8 +632,16 @@ jobs:
           EXTRA: ${{ inputs.image-build-args }}
         run: |
           set -euo pipefail
-          # shellcheck disable=SC2086
-          docker build --secret "id=${SECRET_ID},env=NODE_AUTH_TOKEN" -t "$IMAGE_TAG" $EXTRA "$CONTEXT"
+          if docker buildx inspect ci >/dev/null 2>&1; then
+            # shellcheck disable=SC2086
+            docker buildx build --builder ci --load --secret "id=${SECRET_ID},env=NODE_AUTH_TOKEN" -t "$IMAGE_TAG" $EXTRA "$CONTEXT"
+          else
+            # shellcheck disable=SC2086
+            docker build --secret "id=${SECRET_ID},env=NODE_AUTH_TOKEN" -t "$IMAGE_TAG" $EXTRA "$CONTEXT"
+          fi
+      # The raw token in layer metadata, a literal _authToken value in a known
+      # npmrc, or a checked-out .git copied into the image: each fails the job.
+      # An image without /bin/sh cannot be inspected and is reported, not failed.
       - name: The token is in no layer
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN || github.token }}
@@ -577,9 +650,16 @@ jobs:
           if docker history --no-trunc "$IMAGE_TAG" | grep -qF "$NODE_AUTH_TOKEN"; then
             echo "::error::the package token is in the image history"; exit 1
           fi
-          if docker run --rm --entrypoint sh "$IMAGE_TAG" -c \
-              'cat /app/.npmrc /root/.npmrc /home/*/.npmrc /tmp/*.npmrc 2>/dev/null' | grep -q authToken; then
-            echo "::error::an npmrc with a token is in the image"; exit 1
+          if ! out=$(docker run --rm --label "$CI_LABEL" --entrypoint sh "$IMAGE_TAG" -c \
+              'for f in /app/.npmrc /root/.npmrc /home/*/.npmrc /tmp/*.npmrc; do [ -f "$f" ] && cat "$f"; done; [ -d /app/.git ] && echo CI_TIERS_GIT_DIR; true' 2>/dev/null); then
+            echo "::warning::image has no /bin/sh; npmrc and .git checks skipped"
+          else
+            if printf '%s' "$out" | grep -qE '_authToken=[^$[:space:]]'; then
+              echo "::error::an npmrc with a literal token is in the image"; exit 1
+            fi
+            if printf '%s' "$out" | grep -qF CI_TIERS_GIT_DIR; then
+              echo "::error::/app/.git is in the image; add .git to .dockerignore"; exit 1
+            fi
           fi
       - name: Smoke test
         if: inputs.image-smoke != ''
@@ -588,7 +668,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p image-artifact
-          docker save "$IMAGE_TAG" | gzip -6 > "image-artifact/${IMAGE_NAME}-image-${GITHUB_SHA}.tar.gz"
+          docker save "$IMAGE_TAG" | nice -n 19 gzip -1 > "image-artifact/${IMAGE_NAME}-image-${GITHUB_SHA}.tar.gz"
           ls -l image-artifact
           printf 'artifact %s-image-%s: %s\n' "$IMAGE_NAME" "$GITHUB_SHA" "$IMAGE_TAG" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
@@ -601,35 +681,27 @@ jobs:
       - name: Clean up
         if: always()
         run: |
-          docker rm -f "$PGCONTAINER" >/dev/null 2>&1 || true
-          docker image rm -f "$IMAGE_TAG" >/dev/null 2>&1 || true
+          docker ps -aq --filter "label=$CI_LABEL" | xargs -r docker rm -f >/dev/null 2>&1 || true
+          [ -n "${IMAGE_TAG:-}" ] && docker image rm -f "$IMAGE_TAG" >/dev/null 2>&1 || true
           rm -rf image-artifact
 
   # One stable check for branch protection: "ci / gate". Green when every job
-  # that ran passed; skipped jobs (lower tiers) do not count against it.
+  # that ran passed; skipped jobs (lower tiers) do not count. Not run after a
+  # cancellation (a superseded push), so it never queues ahead of the new run.
   gate:
     name: gate
     needs: [plan, gitleaks, fast, test, e2e-setup, e2e, image]
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ${{ fromJSON(inputs.runs-on-fast) }}
     timeout-minutes: 5
     permissions: {}
     steps:
       - env:
-          NEEDS: ${{ toJSON(needs) }}
+          RESULTS: ${{ toJSON(needs.*.result) }}
+          BAD: ${{ needs.plan.result != 'success' || contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
           TIER: ${{ needs.plan.outputs.tier }}
           REASON: ${{ needs.plan.outputs.reason }}
         run: |
-          set -euo pipefail
-          echo "tier $TIER: $REASON"
-          # shellcheck disable=SC2016  # the single-quoted text is a node script, not shell
-          echo "$NEEDS" | node -e '
-            let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
-              const needs=JSON.parse(s); let bad=[];
-              for (const [job,{result}] of Object.entries(needs)) {
-                console.log(`${job}: ${result}`);
-                if (result==="failure"||result==="cancelled") bad.push(job);
-              }
-              if (needs.plan.result!=="success") bad.push("plan");
-              if (bad.length) { console.log(`::error::failed: ${[...new Set(bad)].join(", ")}`); process.exit(1); }
-            })'
+          echo "tier ${TIER:-?}: ${REASON:-plan did not finish}"
+          echo "results: $RESULTS"
+          [ "$BAD" = false ] || { echo "::error::a required job failed or was cancelled"; exit 1; }

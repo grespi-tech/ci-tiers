@@ -55,6 +55,12 @@ runs:
           echo "${prefix}/bin" >> "$GITHUB_PATH"
           export PATH="${prefix}/bin:$PATH"
         else
+          # Newer Node releases ship without corepack.
+          if ! command -v corepack >/dev/null; then
+            prefix="${RUNNER_TEMP}/corepack-global"
+            npm_config_prefix="$prefix" npm install -g corepack >/dev/null
+            echo "${prefix}/bin" >> "$GITHUB_PATH"; export PATH="${prefix}/bin:$PATH"
+          fi
           corepack enable
           echo "COREPACK_ENABLE_DOWNLOAD_PROMPT=0" >> "$GITHUB_ENV"
         fi
