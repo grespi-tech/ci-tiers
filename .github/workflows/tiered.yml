@@ -382,8 +382,13 @@ jobs:
   # Tier 3, before E2E: a plain Node job for seeding or provisioning.
   e2e-setup:
     name: e2e setup
-    needs: [plan, test]
-    if: inputs.e2e-image != '' && inputs.e2e-setup != '' && fromJSON(needs.plan.outputs.tier) >= 3
+    needs: [plan, fast, test]
+    # !cancelled() + explicit results: a skipped `test` (repo without a test
+    # input) must not skip the rest of tier 3, a failed one must.
+    if: >-
+      !cancelled() && inputs.e2e-image != '' && inputs.e2e-setup != '' && fromJSON(needs.plan.outputs.tier) >= 3
+      && needs.fast.result == 'success'
+      && (needs.test.result == 'success' || (needs.test.result == 'skipped' && inputs.test == ''))
     runs-on: ${{ fromJSON(inputs.runs-on-heavy) }}
     timeout-minutes: ${{ inputs.timeout-test }}
     permissions:
@@ -416,11 +421,12 @@ jobs:
   # outside the runners' cgroup; --cpu-shares 256 so production wins contention.
   e2e:
     name: e2e (${{ matrix.shard }}/${{ strategy.job-total }})
-    needs: [plan, test, e2e-setup]
+    needs: [plan, fast, test, e2e-setup]
     if: >-
       !cancelled() && inputs.e2e-image != '' && fromJSON(needs.plan.outputs.tier) >= 3
-      && needs.test.result == 'success'
-      && (needs.e2e-setup.result == 'success' || needs.e2e-setup.result == 'skipped')
+      && needs.fast.result == 'success'
+      && (needs.test.result == 'success' || (needs.test.result == 'skipped' && inputs.test == ''))
+      && (needs.e2e-setup.result == 'success' || (needs.e2e-setup.result == 'skipped' && inputs.e2e-setup == ''))
     runs-on: ${{ fromJSON(inputs.runs-on-heavy) }}
     timeout-minutes: ${{ inputs.timeout-e2e }}
     permissions:
@@ -518,8 +524,11 @@ jobs:
   # smoke containers are removed at the end so the box's disk does not grow.
   image:
     name: image
-    needs: [plan, test]
-    if: inputs.image && fromJSON(needs.plan.outputs.tier) >= 3
+    needs: [plan, fast, test]
+    if: >-
+      !cancelled() && inputs.image && fromJSON(needs.plan.outputs.tier) >= 3
+      && needs.fast.result == 'success'
+      && (needs.test.result == 'success' || (needs.test.result == 'skipped' && inputs.test == ''))
     runs-on: ${{ fromJSON(inputs.runs-on-heavy) }}
     timeout-minutes: ${{ inputs.timeout-image }}
     permissions:
