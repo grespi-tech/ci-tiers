@@ -1,0 +1,32 @@
+name: export-env
+description: >
+  Export caller-supplied env lines and named secrets into $GITHUB_ENV, masking
+  every secret first. Vendored from grespi-tech/ci-workflows v1.3.0 so this
+  repository pins nothing outside itself. Needs `node` on PATH.
+
+inputs:
+  env:
+    description: >
+      KEY=VALUE lines. `${VAR}` in a value is expanded from the job environment
+      at this point (e.g. ${PGPORT}). Blank lines and # comments are ignored.
+    default: ''
+  secret-names:
+    description: Whitespace-separated names of secrets to export as env vars of the same name.
+    default: ''
+  secrets-json:
+    description: toJSON(secrets) from the calling workflow.
+    default: '{}'
+  secret-lines:
+    description: KEY=VALUE lines of secrets (the ENV_SECRETS workflow secret).
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        EXPORT_ENV_LINES: ${{ inputs.env }}
+        EXPORT_SECRET_NAMES: ${{ inputs.secret-names }}
+        EXPORT_SECRETS_JSON: ${{ inputs.secrets-json }}
+        EXPORT_SECRET_LINES: ${{ inputs.secret-lines }}
+      run: node "$GITHUB_ACTION_PATH/export-env.mjs"

@@ -1,0 +1,577 @@
+name: tiered
+
+# One reusable workflow, four tiers, all on the self-hosted box. The `plan`
+# job decides how much of the pipeline a run deserves; every later job is
+# gated on that number, so a stacked PR costs a typecheck and a push to main
+# costs the full image build. See README.md for the table.
+#
+#   tier 0  nothing      drafts, docs-only changes, label ci:skip
+#   tier 1  fast         typecheck + lint (+ gitleaks): any other PR or branch push
+#   tier 2  test         + unit/integration tests with Postgres: pushes to integration/*
+#   tier 3  full         + E2E + image build and smoke: PRs into main, pushes to main
+#
+# Labels ci:skip / ci:fast / ci:test / ci:full on a PR override the default.
+# The `tier` input overrides everything (for workflow_dispatch).
+
+on:
+  workflow_call:
+    inputs:
+      # ---- commands -------------------------------------------------------
+      fast:
+        description: Tier 1 commands after install, one per line (typecheck, lint, cheap build).
+        type: string
+        required: true
+      test:
+        description: Tier 2 commands (unit and integration tests). Empty = no test job.
+        type: string
+        default: ''
+      e2e-setup:
+        description: Tier 3 commands run in a plain Node job before the Playwright job (seed a database, provision tables).
+        type: string
+        default: ''
+      e2e:
+        description: Tier 3 Playwright test command; `--shard=i/n` is appended. Needs e2e-image.
+        type: string
+        default: pnpm exec playwright test
+      e2e-image:
+        description: Playwright image, e.g. mcr.microsoft.com/playwright:v1.64.1-noble. Its tag MUST match @playwright/test. Empty = no E2E job.
+        type: string
+        default: ''
+      e2e-build:
+        description: Commands run inside the Playwright container before the tests.
+        type: string
+        default: pnpm build
+      e2e-shards:
+        description: JSON list of shard numbers. On one box more shards mostly cost time.
+        type: string
+        default: '[1]'
+      e2e-report-path:
+        type: string
+        default: playwright-report/
+      e2e-container-cpus:
+        type: string
+        default: '2'
+      e2e-container-memory:
+        type: string
+        default: 3g
+      e2e-container-options:
+        description: Extra docker options for the Playwright container (e.g. a -v mount for a shared pnpm store).
+        type: string
+        default: ''
+      image:
+        description: Tier 3 docker build of the repository's Dockerfile, with a token-in-layer check, smoke test and a `docker save` artifact.
+        type: boolean
+        default: false
+      image-name:
+        description: Image name used for the local tag and the artifact. Default = repository name.
+        type: string
+        default: ''
+      image-context:
+        type: string
+        default: .
+      image-build-args:
+        description: Extra `docker build` arguments, e.g. `--file deploy/Dockerfile --target prod`.
+        type: string
+        default: ''
+      image-secret-id:
+        description: BuildKit secret id the Dockerfile mounts for the npm token (`--secret id=<this>,env=NODE_AUTH_TOKEN`).
+        type: string
+        default: npm_token
+      image-smoke:
+        description: Commands run after the build; $IMAGE_TAG names the image, PG* point at the smoke database when `postgres` is set.
+        type: string
+        default: ''
+      image-retention-days:
+        type: number
+        default: 7
+      gitleaks:
+        description: Tier 1 gitleaks scan of the commits this event introduces and of the tree.
+        type: boolean
+        default: false
+      # ---- environment -----------------------------------------------------
+      postgres:
+        description: Postgres image for the test and image-smoke jobs, e.g. postgres:17. Empty = none.
+        type: string
+        default: ''
+      postgres-databases:
+        description: Space-separated databases to create on that server.
+        type: string
+        default: ''
+      env:
+        description: KEY=VALUE lines exported in every job; ${VAR} expands at runtime (${PGPORT} etc.).
+        type: string
+        default: ''
+      secret-names:
+        description: 'Whitespace-separated secret names to export as env vars. Needs `secrets: inherit` (same owner only).'
+        type: string
+        default: ''
+      node-version:
+        type: string
+        default: '22'
+      pnpm-version:
+        description: Empty = corepack + packageManager field.
+        type: string
+        default: ''
+      npm-scope:
+        description: Scope on GitHub Packages, e.g. "@paqett". The caller's GITHUB_TOKEN is used unless NPM_TOKEN is passed.
+        type: string
+        default: ''
+      npm-registry:
+        type: string
+        default: https://npm.pkg.github.com
+      # ---- tiering ---------------------------------------------------------
+      tier:
+        description: auto, or 0-3 to force a tier (pass the caller's workflow_dispatch input through).
+        type: string
+        default: auto
+      main-branch:
+        type: string
+        default: main
+      integration-prefix:
+        type: string
+        default: integration/
+      docs-paths:
+        description: Glob patterns, one per line; a change touching only these is tier 0. `**/` and `/**` are honoured.
+        type: string
+        default: |
+          **/*.md
+          docs/**
+          documentation/**
+          LICENSE
+          .github/ISSUE_TEMPLATE/**
+          .github/pull_request_template.md
+      # ---- runners ---------------------------------------------------------
+      runs-on-fast:
+        description: JSON labels for plan, fast, gitleaks and gate. Switch to ["self-hosted","ci-fast"] once the fast runners exist (runners/README.md).
+        type: string
+        default: '["self-hosted", "ci"]'
+      runs-on-heavy:
+        description: JSON labels for test, e2e and image.
+        type: string
+        default: '["self-hosted", "ci"]'
+      timeout-fast:
+        type: number
+        default: 15
+      timeout-test:
+        type: number
+        default: 30
+      timeout-e2e:
+        type: number
+        default: 45
+      timeout-image:
+        type: number
+        default: 30
+    secrets:
+      ENV_SECRETS:
+        description: KEY=VALUE lines built from the caller's secrets. The only way across owners (a personal-account repo calling this).
+        required: false
+      NPM_TOKEN:
+        description: Token for the npm-scope registry when the caller's GITHUB_TOKEN cannot read it (another owner's packages).
+        required: false
+
+jobs:
+  # Decides the tier. No checkout: changed files come from the compare API.
+  plan:
+    name: plan
+    runs-on: ${{ fromJSON(inputs.runs-on-fast) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tier: ${{ steps.plan.outputs.tier }}
+      reason: ${{ steps.plan.outputs.reason }}
+    steps:
+      - id: plan
+        env:
+          FORCED: ${{ inputs.tier }}
+          MAIN: ${{ inputs.main-branch }}
+          INTEGRATION: ${{ inputs.integration-prefix }}
+          DOCS_PATHS: ${{ inputs.docs-paths }}
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          BEFORE: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          API: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tier=""; reason=""
+          has_label() { printf '%s' "$LABELS" | grep -qF "\"$1\""; }
+
+          # Are all changed files docs? Uses the compare API, so no checkout is
+          # needed. 300+ files, an unknown range or an API error = not docs-only.
+          docs_only() {
+            local base="$1" head="$2" files n f p matched
+            [ -n "$base" ] && [ -n "$head" ] || return 1
+            case "$base" in 0000000000000000000000000000000000000000) return 1;; esac
+            files=$(curl -sSf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$API/repos/$REPO/compare/$base...$head?per_page=1" \
+              | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);const f=j.files||[];if(f.length>=300){process.exit(2)}console.log(f.map(x=>x.filename).join("\n"))})' 2>/dev/null) || return 1
+            [ -n "$files" ] || return 1
+            n=0
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              matched=0
+              while IFS= read -r p; do
+                p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+                [ -n "$p" ] || continue
+                case "$p" in '**/'*) p="*${p#\*\*}";; esac      # **/x.md -> *x.md (matches any depth)
+                case "$p" in *'/**') p="${p%/\*\*}/*";; esac    # docs/** -> docs/*
+                # shellcheck disable=SC2254
+                case "$f" in $p) matched=1; break;; esac
+              done <<< "$DOCS_PATHS"
+              [ "$matched" = 1 ] || return 1
+              n=$((n+1))
+            done <<< "$files"
+            [ "$n" -gt 0 ]
+          }
+
+          if [ "$FORCED" != "auto" ] && [ -n "$FORCED" ]; then
+            case "$FORCED" in 0|1|2|3) tier="$FORCED"; reason="forced by the tier input";;
+              *) echo "::error::tier must be auto or 0-3, got '$FORCED'"; exit 1;; esac
+          elif [ "$EVENT" = pull_request ] && [ "$IS_DRAFT" = true ]; then
+            tier=0; reason="draft pull request"
+          elif has_label ci:skip; then tier=0; reason="label ci:skip"
+          elif has_label ci:full; then tier=3; reason="label ci:full"
+          elif has_label ci:test; then tier=2; reason="label ci:test"
+          elif has_label ci:fast; then tier=1; reason="label ci:fast"
+          elif [ "$EVENT" = pull_request ] && docs_only "$BASE_SHA" "$HEAD_SHA"; then
+            tier=0; reason="docs-only pull request"
+          elif [ "$EVENT" = push ] && docs_only "$BEFORE" "$HEAD_SHA"; then
+            tier=0; reason="docs-only push"
+          elif [ "$EVENT" = push ] && [ "$REF_NAME" = "$MAIN" ]; then
+            tier=3; reason="push to $MAIN"
+          elif [ "$EVENT" = push ] && [ "${REF_NAME#"$INTEGRATION"}" != "$REF_NAME" ]; then
+            tier=2; reason="push to an integration branch"
+          elif [ "$EVENT" = push ]; then
+            tier=1; reason="push to a branch"
+          elif [ "$EVENT" = pull_request ] && [ "$BASE_REF" = "$MAIN" ]; then
+            tier=3; reason="pull request into $MAIN"
+          elif [ "$EVENT" = pull_request ] && [ "${BASE_REF#"$INTEGRATION"}" != "$BASE_REF" ]; then
+            tier=1; reason="pull request into an integration branch"
+          elif [ "$EVENT" = pull_request ]; then
+            tier=1; reason="pull request into a feature branch (stacked)"
+          elif [ "$EVENT" = workflow_dispatch ] && [ "$REF_NAME" = "$MAIN" ]; then
+            tier=3; reason="manual run on $MAIN"
+          elif [ "$EVENT" = workflow_dispatch ]; then
+            tier=2; reason="manual run on a branch"
+          elif [ "$EVENT" = schedule ]; then
+            tier=3; reason="scheduled run"
+          else
+            tier=1; reason="$EVENT: default"
+          fi
+          echo "tier=$tier" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "::notice::tier $tier: $reason"
+          printf '### CI tier %s\n\n%s\n' "$tier" "$reason" >> "$GITHUB_STEP_SUMMARY"
+
+  # Tier 1: gitleaks over the commits this event introduces, then the tree.
+  gitleaks:
+    name: secret scan
+    needs: plan
+    if: inputs.gitleaks && fromJSON(needs.plan.outputs.tier) >= 1
+    runs-on: ${{ fromJSON(inputs.runs-on-fast) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      # sha256 of gitleaks_8.30.1_linux_x64.tar.gz from the release's checksums.txt
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/gitleaks"
+          mkdir -p "$dir"
+          curl -sSfL -o "${dir}/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${dir}/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "${dir}/gitleaks.tar.gz" -C "$dir" gitleaks
+          echo "$dir" >> "$GITHUB_PATH"
+      - name: Scan new commits
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BASE_SHA" ] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            range="${BASE_SHA}..${HEAD_SHA}"
+          else
+            range="-1 ${HEAD_SHA}"
+          fi
+          echo "Scanning commits: ${range}"
+          gitleaks git --redact --no-banner --log-opts="${range}" .
+      - name: Scan working tree
+        run: gitleaks dir --redact --no-banner .
+
+  # Tier 1: typecheck, lint, cheap build. No containers, so it is safe on a
+  # small runner slice next to production.
+  fast:
+    name: fast
+    needs: plan
+    if: fromJSON(needs.plan.outputs.tier) >= 1
+    runs-on: ${{ fromJSON(inputs.runs-on-fast) }}
+    timeout-minutes: ${{ inputs.timeout-fast }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          pnpm-version: ${{ inputs.pnpm-version }}
+          npm-scope: ${{ inputs.npm-scope }}
+          npm-registry: ${{ inputs.npm-registry }}
+          npm-token: ${{ secrets.NPM_TOKEN || github.token }}
+      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
+        with:
+          env: ${{ inputs.env }}
+          secret-names: ${{ inputs.secret-names }}
+          secrets-json: ${{ toJSON(secrets) }}
+          secret-lines: ${{ secrets.ENV_SECRETS }}
+      - name: Fast checks
+        run: ${{ inputs.fast }}
+
+  # Tier 2: tests, with a throwaway Postgres when asked. Waits for `fast` so a
+  # lint failure never spends the heavy slot.
+  test:
+    name: test
+    needs: [plan, fast]
+    if: inputs.test != '' && fromJSON(needs.plan.outputs.tier) >= 2
+    runs-on: ${{ fromJSON(inputs.runs-on-heavy) }}
+    timeout-minutes: ${{ inputs.timeout-test }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          pnpm-version: ${{ inputs.pnpm-version }}
+          npm-scope: ${{ inputs.npm-scope }}
+          npm-registry: ${{ inputs.npm-registry }}
+          npm-token: ${{ secrets.NPM_TOKEN || github.token }}
+      - if: inputs.postgres != ''
+        uses: grespi-tech/ci-tiers/.github/actions/postgres@v1.0.0
+        with:
+          image: ${{ inputs.postgres }}
+          databases: ${{ inputs.postgres-databases }}
+      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
+        with:
+          env: ${{ inputs.env }}
+          secret-names: ${{ inputs.secret-names }}
+          secrets-json: ${{ toJSON(secrets) }}
+          secret-lines: ${{ secrets.ENV_SECRETS }}
+      - name: Tests
+        run: ${{ inputs.test }}
+      - name: Stop Postgres
+        if: always() && inputs.postgres != ''
+        run: docker rm -f "$PGCONTAINER" >/dev/null 2>&1 || true
+
+  # Tier 3, before E2E: a plain Node job for seeding or provisioning.
+  e2e-setup:
+    name: e2e setup
+    needs: [plan, test]
+    if: inputs.e2e-image != '' && inputs.e2e-setup != '' && fromJSON(needs.plan.outputs.tier) >= 3
+    runs-on: ${{ fromJSON(inputs.runs-on-heavy) }}
+    timeout-minutes: ${{ inputs.timeout-test }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          pnpm-version: ${{ inputs.pnpm-version }}
+          npm-scope: ${{ inputs.npm-scope }}
+          npm-registry: ${{ inputs.npm-registry }}
+          npm-token: ${{ secrets.NPM_TOKEN || github.token }}
+      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
+        with:
+          env: ${{ inputs.env }}
+          secret-names: ${{ inputs.secret-names }}
+          secrets-json: ${{ toJSON(secrets) }}
+          secret-lines: ${{ secrets.ENV_SECRETS }}
+      - name: E2E setup
+        run: ${{ inputs.e2e-setup }}
+
+  # Tier 3: Playwright inside Microsoft's image (browsers and their system
+  # packages included). --user 1001 is the runner user's uid on the box, so the
+  # bind-mounted workspace stays writable; Firefox refuses to run as root.
+  # --cpus/--memory: job containers run under dockerd, outside the runners'
+  # cgroup, so the cap has to be set here. --cpu-shares 256 gives the host's
+  # other services priority. --ipc=host is Playwright's recommendation.
+  e2e:
+    name: e2e (${{ matrix.shard }}/${{ strategy.job-total }})
+    needs: [plan, test, e2e-setup]
+    if: >-
+      !cancelled() && inputs.e2e-image != '' && fromJSON(needs.plan.outputs.tier) >= 3
+      && needs.test.result == 'success'
+      && (needs.e2e-setup.result == 'success' || needs.e2e-setup.result == 'skipped')
+    runs-on: ${{ fromJSON(inputs.runs-on-heavy) }}
+    timeout-minutes: ${{ inputs.timeout-e2e }}
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ inputs.e2e-image }}
+      options: >-
+        --user 1001 --cpus ${{ inputs.e2e-container-cpus }} --memory ${{ inputs.e2e-container-memory }}
+        --cpu-shares 256 --ipc=host --init ${{ inputs.e2e-container-options }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(inputs.e2e-shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          pnpm-version: ${{ inputs.pnpm-version }}
+          npm-scope: ${{ inputs.npm-scope }}
+          npm-registry: ${{ inputs.npm-registry }}
+          npm-token: ${{ secrets.NPM_TOKEN || github.token }}
+      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
+        with:
+          env: ${{ inputs.env }}
+          secret-names: ${{ inputs.secret-names }}
+          secrets-json: ${{ toJSON(secrets) }}
+          secret-lines: ${{ secrets.ENV_SECRETS }}
+      - name: Build
+        run: ${{ inputs.e2e-build }}
+      - name: Test
+        env:
+          SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+          TEST: ${{ inputs.e2e }}
+        run: $TEST --shard="$SHARD"
+      # Artifact storage is billed apart from minutes; a storage problem must
+      # not turn a green run red.
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        with:
+          name: playwright-report-${{ matrix.shard }}
+          path: ${{ inputs.e2e-report-path }}
+          retention-days: 14
+
+  # Tier 3: the production image. Built with the npm token as a BuildKit
+  # secret, checked to be in no layer, smoke-tested, then saved as an artifact
+  # the box can `docker load` without registry credentials. The image and the
+  # smoke containers are removed at the end so the box's disk does not grow.
+  image:
+    name: image
+    needs: [plan, test]
+    if: inputs.image && fromJSON(needs.plan.outputs.tier) >= 3
+    runs-on: ${{ fromJSON(inputs.runs-on-heavy) }}
+    timeout-minutes: ${{ inputs.timeout-image }}
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE_NAME: ${{ inputs.image-name || github.event.repository.name }}
+      IMAGE_TAG: ${{ inputs.image-name || github.event.repository.name }}:${{ github.sha }}
+      DOCKER_BUILDKIT: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - if: inputs.postgres != '' && inputs.image-smoke != ''
+        uses: grespi-tech/ci-tiers/.github/actions/postgres@v1.0.0
+        with:
+          image: ${{ inputs.postgres }}
+          databases: ${{ inputs.postgres-databases }}
+      # setup-node only so export-env has node; nothing is installed.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
+        with:
+          env: ${{ inputs.env }}
+          secret-names: ${{ inputs.secret-names }}
+          secrets-json: ${{ toJSON(secrets) }}
+          secret-lines: ${{ secrets.ENV_SECRETS }}
+      - name: Build
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN || github.token }}
+          SECRET_ID: ${{ inputs.image-secret-id }}
+          CONTEXT: ${{ inputs.image-context }}
+          EXTRA: ${{ inputs.image-build-args }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          docker build --secret "id=${SECRET_ID},env=NODE_AUTH_TOKEN" -t "$IMAGE_TAG" $EXTRA "$CONTEXT"
+      - name: The token is in no layer
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          if docker history --no-trunc "$IMAGE_TAG" | grep -qF "$NODE_AUTH_TOKEN"; then
+            echo "::error::the package token is in the image history"; exit 1
+          fi
+          if docker run --rm --entrypoint sh "$IMAGE_TAG" -c \
+              'cat /app/.npmrc /root/.npmrc /home/*/.npmrc /tmp/*.npmrc 2>/dev/null' | grep -q authToken; then
+            echo "::error::an npmrc with a token is in the image"; exit 1
+          fi
+      - name: Smoke test
+        if: inputs.image-smoke != ''
+        run: ${{ inputs.image-smoke }}
+      - name: Save image artifact
+        run: |
+          set -euo pipefail
+          mkdir -p image-artifact
+          docker save "$IMAGE_TAG" | gzip -6 > "image-artifact/${IMAGE_NAME}-image-${GITHUB_SHA}.tar.gz"
+          ls -l image-artifact
+          printf 'artifact %s-image-%s: %s\n' "$IMAGE_NAME" "$GITHUB_SHA" "$IMAGE_TAG" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IMAGE_NAME }}-image-${{ github.sha }}
+          path: image-artifact/${{ env.IMAGE_NAME }}-image-${{ github.sha }}.tar.gz
+          retention-days: ${{ inputs.image-retention-days }}
+          compression-level: 0 # already gzipped
+          if-no-files-found: error
+      - name: Clean up
+        if: always()
+        run: |
+          docker rm -f "$PGCONTAINER" >/dev/null 2>&1 || true
+          docker image rm -f "$IMAGE_TAG" >/dev/null 2>&1 || true
+          rm -rf image-artifact
+
+  # One stable check for branch protection: "ci / gate". Green when every job
+  # that ran passed; skipped jobs (lower tiers) do not count against it.
+  gate:
+    name: gate
+    needs: [plan, gitleaks, fast, test, e2e-setup, e2e, image]
+    if: always()
+    runs-on: ${{ fromJSON(inputs.runs-on-fast) }}
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+          TIER: ${{ needs.plan.outputs.tier }}
+          REASON: ${{ needs.plan.outputs.reason }}
+        run: |
+          set -euo pipefail
+          echo "tier $TIER: $REASON"
+          # shellcheck disable=SC2016  # the single-quoted text is a node script, not shell
+          echo "$NEEDS" | node -e '
+            let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+              const needs=JSON.parse(s); let bad=[];
+              for (const [job,{result}] of Object.entries(needs)) {
+                console.log(`${job}: ${result}`);
+                if (result==="failure"||result==="cancelled") bad.push(job);
+              }
+              if (needs.plan.result!=="success") bad.push("plan");
+              if (bad.length) { console.log(`::error::failed: ${[...new Set(bad)].join(", ")}`); process.exit(1); }
+            })'

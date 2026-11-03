@@ -1,0 +1,70 @@
+name: setup
+description: >
+  Node + pnpm + `pnpm install --frozen-lockfile` for a self-hosted runner.
+  pnpm comes from corepack (the package.json "packageManager" field) or, when
+  `pnpm-version` is set, from a per-job global install under $RUNNER_TEMP, so
+  concurrent jobs on one box never replace each other's binary. No third-party
+  actions: the paqett organisation allows GitHub-owned actions only.
+
+inputs:
+  node-version:
+    default: '22'
+  pnpm-version:
+    description: Empty = corepack + the packageManager field. Otherwise an exact pnpm version or range.
+    default: ''
+  npm-scope:
+    description: Scope served by a private registry, e.g. "@paqett". Empty = none.
+    default: ''
+  npm-registry:
+    default: https://npm.pkg.github.com
+  npm-token:
+    description: Token for that registry. The caller's GITHUB_TOKEN reads same-organisation GitHub Packages.
+    default: ''
+  install:
+    description: Run `pnpm install --frozen-lockfile`.
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    # Two setup-node steps because `with:` cannot be made conditional per key.
+    # With a scope, setup-node writes a user-level .npmrc (NPM_CONFIG_USERCONFIG)
+    # holding `//<registry>/:_authToken=${NODE_AUTH_TOKEN}`; pnpm 11 ignores a
+    # token in the project .npmrc, which should only name the registry.
+    - if: inputs.npm-scope != ''
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        registry-url: ${{ inputs.npm-registry }}
+        scope: ${{ inputs.npm-scope }}
+    - if: inputs.npm-scope == ''
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: pnpm
+      shell: bash
+      env:
+        PNPM_VERSION: ${{ inputs.pnpm-version }}
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+      run: |
+        set -euo pipefail
+        if [ -n "$PNPM_VERSION" ]; then
+          prefix="${RUNNER_TEMP}/pnpm-global"
+          npm_config_prefix="$prefix" npm install -g "pnpm@${PNPM_VERSION}" >/dev/null
+          echo "${prefix}/bin" >> "$GITHUB_PATH"
+          export PATH="${prefix}/bin:$PATH"
+        else
+          corepack enable
+          echo "COREPACK_ENABLE_DOWNLOAD_PROMPT=0" >> "$GITHUB_ENV"
+        fi
+        echo "pnpm $(pnpm --version)"
+
+    # No actions/cache: on a self-hosted runner the pnpm store on the box is
+    # shared by every job and outlives the Actions cache.
+    - name: Install
+      if: inputs.install == 'true'
+      shell: bash
+      env:
+        NODE_AUTH_TOKEN: ${{ inputs.npm-token }}
+      run: pnpm install --frozen-lockfile

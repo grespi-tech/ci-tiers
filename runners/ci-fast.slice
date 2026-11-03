@@ -1,0 +1,18 @@
+# systemd slice for the "fast" runners: typecheck, lint, gitleaks, plan, gate.
+# No containers run in this tier, so a small cap is enough and production
+# always wins contention. Install: /etc/systemd/system/ci-fast.slice
+[Unit]
+Description=CI fast-tier runners (typecheck, lint)
+Before=slices.target
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+# One vCPU across every fast runner together; two runners share it.
+CPUQuota=100%
+CPUWeight=50
+MemoryHigh=1536M
+MemoryMax=2G
+IOWeight=50
+TasksMax=1024

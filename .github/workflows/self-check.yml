@@ -1,0 +1,36 @@
+name: self-check
+
+# actionlint + shellcheck over this repository. GitHub-hosted on purpose, the
+# one exception to "everything on the box": this repository is public, and the
+# runner groups on the box refuse public repositories (a fork's PR must never
+# execute on a runner that sits next to production).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: 1.7.7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/actionlint"; mkdir -p "$dir"
+          curl -sSfL -o "$dir/al.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o "$dir/checksums.txt" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          (cd "$dir" && grep "linux_amd64.tar.gz" checksums.txt | sed 's#actionlint_[^ ]*#al.tar.gz#' | sha256sum -c -)
+          tar -xzf "$dir/al.tar.gz" -C "$dir" actionlint
+          echo "$dir" >> "$GITHUB_PATH"
+      - run: actionlint -color
+      - run: shellcheck -x runners/*.sh
