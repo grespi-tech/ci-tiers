@@ -191,6 +191,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           BASE_REF: ${{ github.base_ref }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           BEFORE: ${{ github.event.before }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -234,6 +235,9 @@ jobs:
           if [ "$FORCED" != "auto" ] && [ -n "$FORCED" ]; then
             case "$FORCED" in 0|1|2|3) tier="$FORCED"; reason="forced by the tier input";;
               *) echo "::error::tier must be auto or 0-3, got '$FORCED'"; exit 1;; esac
+          elif [ "$EVENT" = pull_request ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$REPO" ]; then
+            # Code from another repository never runs on the self-hosted box.
+            tier=0; reason="pull request from a fork: not run on self-hosted runners"
           elif [ "$EVENT" = pull_request ] && [ "$IS_DRAFT" = true ]; then
             tier=0; reason="draft pull request"
           elif has_label ci:skip; then tier=0; reason="label ci:skip"

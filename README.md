@@ -7,7 +7,7 @@ pays for the image build.
 
 | Tier | Jobs | When |
 | --- | --- | --- |
-| 0 | nothing (gate is green) | draft PR, docs-only change, label `ci:skip` |
+| 0 | nothing (gate is green) | draft PR, PR from a fork, docs-only change, label `ci:skip` |
 | 1 | `fast` (typecheck, lint, cheap build), optional `secret scan` | any other PR, any branch push |
 | 2 | + `test` (unit and integration, throwaway Postgres) | push to `integration/*`, label `ci:test` |
 | 3 | + `e2e setup`, `e2e` (Playwright), `image` (build, token check, smoke, `docker save` artifact) | PR into `main`, push to `main`, label `ci:full` |
@@ -133,6 +133,16 @@ An organisation that restricts actions must allow
 does (alongside `grespi-tech/ci-workflows`). This workflow uses only
 GitHub-owned actions plus its own composite actions, so no third-party
 pattern is needed: pnpm comes from corepack, not `pnpm/action-setup`.
+
+## Security
+
+Every job runs on self-hosted runners that share a box with production. That
+is a deliberate choice by the owner, with two mitigations built in: a pull
+request whose head is another repository is always tier 0, so fork code never
+executes on the box, and the fast tier's runners should run with no Docker
+socket (`runners/`). Jobs still execute the pull request's own code (its
+package scripts, its tests); only people who can push to these repositories
+can reach the runners.
 
 ## Design notes
 
