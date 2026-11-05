@@ -50,7 +50,7 @@ jobs:
   ci:
     # Drafts do not even start a run; marking "ready for review" does.
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    uses: grespi-tech/ci-tiers/.github/workflows/tiered.yml@v1.0.0
+    uses: grespi-tech/ci-tiers/.github/workflows/tiered.yml@v1.0.1
     secrets: inherit               # same owner only; see Secrets
     with:
       tier: ${{ inputs.tier || 'auto' }}
@@ -85,7 +85,7 @@ jobs:
 `pull_request` has no `branches:` filter on purpose: PRs into `integration/*`
 and PRs stacked on another PR's branch must trigger, and they get tier 1.
 
-Pin an exact tag (`@v1.0.0`). Tags are never moved once a caller uses them; a
+Pin an exact tag (`@v1.0.1`). Tags are never moved once a caller uses them; a
 fix is a new tag. The workflow references its own composite actions at the
 same tag, and `self-check.yml` fails a tagged commit whose references do not
 match its tag.
@@ -116,7 +116,10 @@ Tiering: `tier` (`auto` or 0-3), `main-branch` (`main`), `integration-prefix`
 
 Runners: `runs-on-fast` (`["self-hosted","ci"]`; switch to `ci-fast` after
 installing the fast runners, see `runners/README.md`), `runs-on-heavy`,
-`timeout-fast` (15), `timeout-test` (30), `timeout-e2e` (45), `timeout-image` (30).
+`timeout-fast` (135), `timeout-test` (150), `timeout-e2e` (165), `timeout-image` (150).
+Each includes up to 120 minutes queued behind the box-wide CI lock: the
+runners' job-started hook holds a job in "Set up runner" until the lock and
+enough free disk are available, and that wait counts against the job's limit.
 
 ## Secrets
 
@@ -208,3 +211,5 @@ can reach the runners.
 ## History
 
 - `v1.0.0`: first release.
+- `v1.0.1`: job time limits include up to 120 min queued behind the box-wide
+  CI lock (v1.0.0's 5-min plan limit expired while a Sparsh E2E run held it).

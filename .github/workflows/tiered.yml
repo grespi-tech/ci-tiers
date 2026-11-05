@@ -154,17 +154,21 @@ on:
         type: string
         default: '["self-hosted", "ci"]'
       timeout-fast:
+        description: Minutes, including up to 120 queued behind the box-wide CI lock.
         type: number
-        default: 15
+        default: 135
       timeout-test:
+        description: Minutes, including up to 120 queued behind the box-wide CI lock.
         type: number
-        default: 30
+        default: 150
       timeout-e2e:
+        description: Minutes, including up to 120 queued behind the box-wide CI lock.
         type: number
-        default: 45
+        default: 165
       timeout-image:
+        description: Minutes, including up to 120 queued behind the box-wide CI lock.
         type: number
-        default: 30
+        default: 150
     secrets:
       ENV_SECRETS:
         description: KEY=VALUE lines built from the caller's secrets. The only way across owners (a personal-account repo calling this).
@@ -182,7 +186,10 @@ jobs:
   plan:
     name: plan
     runs-on: ${{ fromJSON(inputs.runs-on-fast) }}
-    timeout-minutes: 5
+    # Every timeout here includes up to 120 min queued behind the box-wide CI
+    # lock (the runners' job-started hook, WAIT_MAX_MIN in limits.conf): that
+    # wait counts against the job's own time limit.
+    timeout-minutes: 125
     permissions:
       contents: read
     outputs:
@@ -304,7 +311,7 @@ jobs:
     needs: plan
     if: inputs.gitleaks && fromJSON(needs.plan.outputs.tier || '0') >= 1
     runs-on: ${{ fromJSON(inputs.runs-on-fast) }}
-    timeout-minutes: 10
+    timeout-minutes: 130
     permissions:
       contents: read
     env:
@@ -358,14 +365,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
+      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.1
         with:
           node-version: ${{ inputs.node-version }}
           pnpm-version: ${{ inputs.pnpm-version }}
           npm-scope: ${{ inputs.npm-scope }}
           npm-registry: ${{ inputs.npm-registry }}
           npm-token: ${{ secrets.NPM_TOKEN || github.token }}
-      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
+      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.1
         with:
           env: ${{ inputs.env }}
           secret-names: ${{ inputs.secret-names }}
@@ -389,7 +396,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
+      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.1
         with:
           node-version: ${{ inputs.node-version }}
           pnpm-version: ${{ inputs.pnpm-version }}
@@ -397,12 +404,12 @@ jobs:
           npm-registry: ${{ inputs.npm-registry }}
           npm-token: ${{ secrets.NPM_TOKEN || github.token }}
       - if: inputs.postgres != ''
-        uses: grespi-tech/ci-tiers/.github/actions/postgres@v1.0.0
+        uses: grespi-tech/ci-tiers/.github/actions/postgres@v1.0.1
         with:
           image: ${{ inputs.postgres }}
           databases: ${{ inputs.postgres-databases }}
           instance: test
-      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
+      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.1
         with:
           env: ${{ inputs.env }}
           secret-names: ${{ inputs.secret-names }}
@@ -434,14 +441,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
+      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.1
         with:
           node-version: ${{ inputs.node-version }}
           pnpm-version: ${{ inputs.pnpm-version }}
           npm-scope: ${{ inputs.npm-scope }}
           npm-registry: ${{ inputs.npm-registry }}
           npm-token: ${{ secrets.NPM_TOKEN || github.token }}
-      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
+      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.1
         with:
           env: ${{ inputs.env }}
           secret-names: ${{ inputs.secret-names }}
@@ -483,7 +490,7 @@ jobs:
         with:
           persist-credentials: false
       # Node and pnpm on the host only to find the pnpm store; nothing is installed here.
-      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.0
+      - uses: grespi-tech/ci-tiers/.github/actions/setup@v1.0.1
         with:
           node-version: ${{ inputs.node-version }}
           pnpm-version: ${{ inputs.pnpm-version }}
@@ -491,14 +498,14 @@ jobs:
       - name: Network
         run: docker network create --label "$CI_LABEL" "$NET" >/dev/null
       - if: inputs.postgres != ''
-        uses: grespi-tech/ci-tiers/.github/actions/postgres@v1.0.0
+        uses: grespi-tech/ci-tiers/.github/actions/postgres@v1.0.1
         with:
           image: ${{ inputs.postgres }}
           databases: ${{ inputs.postgres-databases }}
           instance: e2e-${{ matrix.shard }}
           network: ${{ env.NET }}
       - id: env
-        uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
+        uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.1
         with:
           env: ${{ inputs.env }}
           secret-names: ${{ inputs.secret-names }}
@@ -609,7 +616,7 @@ jobs:
             echo "IMAGE_TAG=${name}:${GITHUB_SHA}"
           } >> "$GITHUB_ENV"
       - if: inputs.postgres != '' && inputs.image-smoke != ''
-        uses: grespi-tech/ci-tiers/.github/actions/postgres@v1.0.0
+        uses: grespi-tech/ci-tiers/.github/actions/postgres@v1.0.1
         with:
           image: ${{ inputs.postgres }}
           databases: ${{ inputs.postgres-databases }}
@@ -618,7 +625,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.0
+      - uses: grespi-tech/ci-tiers/.github/actions/export-env@v1.0.1
         with:
           env: ${{ inputs.env }}
           secret-names: ${{ inputs.secret-names }}
@@ -693,7 +700,7 @@ jobs:
     needs: [plan, gitleaks, fast, test, e2e-setup, e2e, image]
     if: ${{ !cancelled() }}
     runs-on: ${{ fromJSON(inputs.runs-on-fast) }}
-    timeout-minutes: 5
+    timeout-minutes: 125
     permissions: {}
     steps:
       - env:
