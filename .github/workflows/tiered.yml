@@ -13,9 +13,11 @@ name: tiered
 # Labels ci:skip / ci:fast / ci:test / ci:full on a PR override the default.
 # The `tier` input overrides everything (for workflow_dispatch).
 #
-# Containers started here carry the label ci-tiers.run=<run id>; the clean-up
-# steps remove everything with that label, so a failed step cannot leave a
-# container behind on the box. Callers' own containers should carry it too.
+# Containers started here carry the label ci-tiers.run=<run id> plus ci-tiers.job=<job>;
+# each job's clean-up removes its own (run + job), so a failed step cannot leave a
+# container behind and one job's clean-up cannot kill a sibling job still running.
+# Callers' own containers should carry ci-tiers.run too; they should also remove
+# them themselves (e.g. --rm or a trap), since clean-up only sweeps by job label.
 
 on:
   workflow_call:
@@ -688,7 +690,9 @@ jobs:
       - name: Clean up
         if: always()
         run: |
-          docker ps -aq --filter "label=$CI_LABEL" | xargs -r docker rm -f >/dev/null 2>&1 || true
+          # Only this job's containers: e2e runs alongside the image job in the same run, and an
+          # unscoped run-label sweep here force-removed its Playwright and Postgres containers (exit 137).
+          docker ps -aq --filter "label=$CI_LABEL" --filter "label=ci-tiers.job=image" | xargs -r docker rm -f >/dev/null 2>&1 || true
           [ -n "${IMAGE_TAG:-}" ] && docker image rm -f "$IMAGE_TAG" >/dev/null 2>&1 || true
           rm -rf image-artifact
 
