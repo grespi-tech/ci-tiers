@@ -1,6 +1,7 @@
 name: self-check
 
-# actionlint + shellcheck over this repository. GitHub-hosted on purpose, the
+# actionlint + shellcheck over this repository, and the image job's keep and
+# prune steps run against a real Docker daemon. GitHub-hosted on purpose, the
 # one exception to "everything on the box": this repository is public, and the
 # runner groups on the box refuse public repositories (a fork's PR must never
 # execute on a runner that sits next to production).
@@ -33,7 +34,7 @@ jobs:
           tar -xzf "$dir/al.tar.gz" -C "$dir" actionlint
           echo "$dir" >> "$GITHUB_PATH"
       - run: actionlint -color
-      - run: shellcheck -x runners/*.sh
+      - run: shellcheck -x runners/*.sh .github/tests/*.sh
       # The workflow pins its own composite actions at a tag. A tagged commit
       # whose references name another tag would run stale actions silently.
       - name: Self-references match the tag
@@ -45,3 +46,13 @@ jobs:
           echo "tag: ${tag:-none}; references: $refs"
           [ "$(printf '%s\n' "$refs" | wc -l)" -eq 1 ] || { echo "::error::mixed action references"; exit 1; }
           [ -z "$tag" ] || [ "$refs" = "$tag" ] || { echo "::error::tagged $tag but actions reference $refs"; exit 1; }
+
+  # The image job's keep-and-prune steps run on the production box, so they are
+  # tested here first, against the hosted runner's own Docker: what is kept,
+  # what is pruned, what is never touched.
+  image-keep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: .github/tests/image-keep.sh
