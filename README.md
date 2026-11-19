@@ -10,7 +10,7 @@ pays for the image build.
 | 0 | nothing (gate is green) | draft PR, PR from a fork, docs-only change, label `ci:skip` (anyone with triage rights can apply it: an intentional bypass, visible in the run summary) |
 | 1 | `fast` (typecheck, lint, cheap build), optional `secret scan` | any other PR, any branch push |
 | 2 | + `test` (unit and integration, throwaway Postgres) | push to `integration/*`, label `ci:test` |
-| 3 | + `e2e setup`, `e2e` (Playwright), `image` (build, token check, smoke, `docker save` artifact) | PR into `main`, push to `main`, label `ci:full` |
+| 3 | + `e2e setup`, `e2e` (Playwright), `image` (build, token check, smoke, kept on the box for the deploy script) | PR into `main`, push to `main`, label `ci:full` |
 
 Each tier waits for the one below it: a lint failure never spends the heavy
 slot. The `gate` job is the single check to require in branch protection
@@ -50,7 +50,7 @@ jobs:
   ci:
     # Drafts do not even start a run; marking "ready for review" does.
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    uses: grespi-tech/ci-tiers/.github/workflows/tiered.yml@v1.0.1
+    uses: grespi-tech/ci-tiers/.github/workflows/tiered.yml@v1.1.0
     secrets: inherit               # same owner only; see Secrets
     with:
       tier: ${{ inputs.tier || 'auto' }}
@@ -70,6 +70,11 @@ jobs:
       e2e: pnpm test:e2e
       image: true
       image-secret-id: npm_token   # the Dockerfile's --mount=type=secret,id=...
+      # Kept on the box as <image-keep-name>:<sha>, the name the deploy script runs; see "Images on the box".
+      image-keep-name: ghcr.io/example/app
+      image-keep-protect: |
+        /opt/app/.current_tag
+        /opt/app/.previous_tag
       # $CI_LABEL on every container you start: the job's clean-up removes
       # whatever carries it, even if a line below fails. Pick a free port;
       # the smoke container shares the box's host network.
@@ -85,7 +90,7 @@ jobs:
 `pull_request` has no `branches:` filter on purpose: PRs into `integration/*`
 and PRs stacked on another PR's branch must trigger, and they get tier 1.
 
-Pin an exact tag (`@v1.0.1`). Tags are never moved once a caller uses them; a
+Pin an exact tag (`@v1.1.0`). Tags are never moved once a caller uses them; a
 fix is a new tag. The workflow references its own composite actions at the
 same tag, and `self-check.yml` fails a tagged commit whose references do not
 match its tag.
@@ -101,9 +106,14 @@ E2E: `e2e-image` (empty = no E2E), `e2e-shards` (`'[1]'`), `e2e-report-path`,
 
 Image: `image` (false), `image-name` (repository name), `image-context` (`.`),
 `image-build-args` (e.g. `--file deploy/Dockerfile`), `image-secret-id`
-(`npm_token`), `image-retention-days` (7). The build gets the npm token as a
+(`npm_token`), `image-keep-local` (true), `image-keep-name` (the image name),
+`image-keep-count` (5), `image-keep-protect` (empty), `image-artifact` (false),
+`image-retention-days` (7, artifact only). The build gets the npm token as a
 BuildKit secret only; the job fails if the token or an `authToken` npmrc is
 found in the image. `$IMAGE_TAG` names the built image in `image-smoke`.
+
+E2E reports (`e2e-report-path`) are uploaded only when the E2E job fails, and
+kept 3 days.
 
 Environment: `postgres` (image; empty = none), `postgres-databases`, `env`
 (`KEY=VALUE` lines; `${PGHOST}`, `${PGPORT}` etc. expand at runtime), `secret-names`,
@@ -120,6 +130,46 @@ installing the fast runners, see `runners/README.md`), `runs-on-heavy`,
 Each includes up to 120 minutes queued behind the box-wide CI lock: the
 runners' job-started hook holds a job in "Set up runner" until the lock and
 enough free disk are available, and that wait counts against the job's limit.
+
+## Images on the box
+
+The runners use the box's own Docker daemon, which is also production's, so
+the image the `image` job built and smoke-tested is already where it will be
+deployed. With `image-keep-local: true` (the default) it stays there:
+
+- **Name.** After the smoke test it is tagged `<image-keep-name>:<full commit
+  sha>`, the name the deploy script runs (for example
+  `ghcr.io/paqett/console`); the build's own tag is removed if it differs. A
+  deploy is then just `deploy.sh --local <sha>`: no download, no `docker load`.
+- **Not for pull requests.** A `pull_request` run builds from a temporary merge
+  commit that is never deployed, so its image is not kept.
+- **Pruning.** The kept images of that name are the tags that are a full
+  40-hex commit sha (`:main` or `:<sha>-<branch>` from a registry are never
+  touched). After keeping its own, the job keeps the newest `image-keep-count`
+  (by creation time) and removes the older ones, except an image any
+  container uses (running or stopped, by name or by id) and the tags written
+  in the `image-keep-protect` files (one tag per file, e.g. a deploy
+  directory's `.current_tag` and `.previous_tag`; globs allowed). Removal is
+  `docker image rm` without `-f`, so Docker itself also refuses an image a
+  container still needs. The summary and the log list what was kept and why.
+- **Unreadable tag files.** The runner user (`gha-runner`) may not be able to
+  read them (a 0700 deploy directory). They are reported with a notice and
+  skipped: the running release is still protected by its container, and the
+  previous one by being among the newest `image-keep-count`. A rollback to an
+  older pruned build needs the artifact (below) or a registry pull.
+- **Disk.** Images of one repository share their base layers, so each extra
+  kept build costs only its changed layers; `image-keep-count` bounds it. The
+  runners' job-started hook still refuses to start a job on a nearly full disk.
+- **The artifact** is still there when wanted: `image-artifact: true` also
+  saves the image (`docker save | gzip`, its build name) and uploads it as
+  `<image-name>-image-<sha>` for `image-retention-days`. It counts against the
+  owner's GitHub storage, which on a free plan is 0.5 GB measured in GB-hours
+  over the month (a 100 MB artifact kept 7 days is about 17 GB-hours); a full
+  quota also blocks GitHub Packages publishing. Callers can expose it as a
+  `workflow_dispatch` input for the rare run that needs one.
+
+`image-keep-local: false` with `image-artifact: false` builds and smoke-tests
+the image and keeps nothing.
 
 ## Secrets
 
@@ -213,3 +263,12 @@ can reach the runners.
 - `v1.0.0`: first release.
 - `v1.0.1`: job time limits include up to 120 min queued behind the box-wide
   CI lock (v1.0.0's 5-min plan limit expired while a Sparsh E2E run held it).
+- `v1.1.0`: the image is kept on the box for the deploy scripts
+  (`image-keep-local`, `image-keep-name`, `image-keep-count`,
+  `image-keep-protect`) instead of round-tripping through a GitHub artifact,
+  which is now opt-in (`image-artifact`, default false). Playwright reports
+  are uploaded only on failure and kept 3 days. The image job's clean-up
+  removes only its own containers (it used to kill a concurrent E2E job's,
+  exit 137), and never untags an image a container runs. Upgrading: a caller
+  that deployed from the artifact sets `image-keep-name` to its deploy
+  script's image name, or `image-artifact: true` to keep the old behaviour.
